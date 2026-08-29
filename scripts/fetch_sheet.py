@@ -13,6 +13,7 @@ import io
 import json
 import os
 import sys
+import urllib.parse
 from pathlib import Path
 
 import google.auth.transport.requests
@@ -76,11 +77,63 @@ def explain_failure(response, info: dict) -> str:
     )
 
 
+BASE = "https://sheets.googleapis.com/v4/spreadsheets"
+
+# A tab is the responses tab if its header row mentions these. Scored rather
+# than matched exactly so a reworded form still resolves.
+HEADER_MARKERS = ("street address", "priority", "address", "timestamp")
+
+
+def a1(title: str, cells: str) -> str:
+    """Quote a tab name for A1 notation; embedded apostrophes double up."""
+    return f"'{title.replace(chr(39), chr(39) * 2)}'!{cells}"
+
+
+def choose_tab(session, sheet_id: str) -> str:
+    """Pick the tab that looks like form responses.
+
+    Without an explicit tab name the API reads whichever tab happens to be
+    first, which is not necessarily the one holding the responses.
+    """
+    meta = session.get(
+        f"{BASE}/{sheet_id}", params={"fields": "sheets.properties(title)"}
+    )
+    meta.raise_for_status()
+    tabs = [s["properties"]["title"] for s in meta.json().get("sheets", [])]
+    if not tabs:
+        sys.exit("Spreadsheet has no tabs.")
+    if len(tabs) == 1:
+        return tabs[0]
+
+    headers = session.get(
+        f"{BASE}/{sheet_id}/values:batchGet",
+        params={"ranges": [a1(t, "1:1") for t in tabs], "majorDimension": "ROWS"},
+    )
+    headers.raise_for_status()
+
+    scored = []
+    for title, block in zip(tabs, headers.json().get("valueRanges", [])):
+        values = block.get("values") or [[]]
+        row = " ".join(values[0])
+        score = sum(marker in row.lower() for marker in HEADER_MARKERS)
+        scored.append((score, len(row), title))
+
+    scored.sort(reverse=True)
+    best_score, _, best = scored[0]
+    print(f"tabs found: {', '.join(tabs)}")
+    if best_score == 0:
+        sys.exit(
+            f"No tab looks like form responses (none of {HEADER_MARKERS} in any "
+            "header row). Set the SHEET_TAB variable to the correct tab name."
+        )
+    print(f"using tab: {best!r} (matched {best_score}/{len(HEADER_MARKERS)} markers)")
+    return best
+
+
 def main() -> None:
     sheet_id = os.environ.get("SHEET_ID")
     if not sheet_id:
         sys.exit("SHEET_ID is not set.")
-    cell_range = os.environ.get("SHEET_RANGE", "A:Z")
 
     info = key_material()
     print(f"authenticating as {info.get('client_email', '?')}")
@@ -89,23 +142,30 @@ def main() -> None:
     creds.refresh(google.auth.transport.requests.Request())
 
     session = google.auth.transport.requests.AuthorizedSession(creds)
-    url = (
-        f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}"
-        f"/values/{cell_range}"
-    )
-    response = session.get(url, params={"majorDimension": "ROWS"})
 
-    if response.status_code == 403:
-        sys.exit(explain_failure(response, info))
-    if response.status_code == 404:
+    # Probe the spreadsheet itself first: auth problems surface here, before
+    # tab selection can muddy the diagnosis.
+    probe = session.get(f"{BASE}/{sheet_id}", params={"fields": "spreadsheetId"})
+    if probe.status_code == 403:
+        sys.exit(explain_failure(probe, info))
+    if probe.status_code == 404:
         sys.exit(
             "No sheet with that id (404). SHEET_ID must be just the id from the "
             "URL, the part between /d/ and /edit, not the whole URL."
         )
+    probe.raise_for_status()
+
+    tab = os.environ.get("SHEET_TAB") or choose_tab(session, sheet_id)
+    cell_range = os.environ.get("SHEET_RANGE") or a1(tab, "A:AZ")
+
+    response = session.get(
+        f"{BASE}/{sheet_id}/values/{urllib.parse.quote(cell_range, safe='')}",
+        params={"majorDimension": "ROWS"},
+    )
     response.raise_for_status()
     rows = response.json().get("values", [])
     if not rows:
-        sys.exit("Sheet returned no rows.")
+        sys.exit(f"Tab {tab!r} returned no rows.")
 
     # The API truncates trailing empty cells, so pad every row to the header.
     width = max(len(r) for r in rows)
