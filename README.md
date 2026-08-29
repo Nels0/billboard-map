@@ -84,6 +84,38 @@ not for wide distribution. If the recipient list grows past a handful of people,
 move to Cloudflare Pages with Cloudflare Access (free for up to 50 users), which
 gives per-person allowlisting and revocation; only the hosting layer changes.
 
+## Supply chain
+
+The scheduled job holds the service account key and the map passphrase in its
+environment, so anything that executes inside it can read both. Two pins keep
+that set closed:
+
+- **Actions are pinned to commit SHAs**, not tags, with the version in a trailing
+  comment. A tag can be repointed at new code by whoever controls the action's
+  repository, which is how the `tj-actions/changed-files` compromise spread; a
+  SHA cannot be repointed.
+- **Python dependencies install from `requirements.lock` with
+  `--require-hashes`**, which pins all 11 packages including transitive ones and
+  refuses any artifact whose hash is not listed. A compromised release of
+  `requests` or `cffi` cannot execute here. Verified by corrupting a hash and
+  confirming pip aborts.
+
+`requirements.txt` still holds the loose direct dependencies; it is the input to
+the lockfile, not what CI installs. Regenerate after changing it:
+
+```bash
+uv pip compile requirements.txt --generate-hashes \
+  --python-version 3.12 --output-file requirements.lock
+```
+
+Pinning freezes versions, so Dependabot (`.github/dependabot.yml`) proposes
+weekly updates for both ecosystems rather than letting the pins go stale.
+
+Two things this does **not** cover. The job runs with `contents: write` and
+pushes to `main`, so a compromise could alter the published page as well as read
+secrets. And all three secrets are set at job level, so every step can see them;
+scoping each secret to the step that needs it would narrow that further.
+
 ## One-time setup
 
 1. **Create the repo and push.** It must be public for GitHub Pages on a free

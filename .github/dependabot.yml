@@ -1,0 +1,20 @@
+version: 2
+
+# Pinning to SHAs and artifact hashes stops a compromised release reaching this
+# repo, but it also freezes the versions. These two ecosystems keep the pins
+# moving so the workflow does not sit on stale, vulnerable dependencies.
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    # Dependabot rewrites the SHA and the trailing "# vX.Y.Z" comment together.
+    commit-message:
+      prefix: "ci"
+
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "deps"
