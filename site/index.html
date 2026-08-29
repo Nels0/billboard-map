@@ -145,6 +145,17 @@
   }
   #toast.show { display: block; }
 
+  /* Leaflet hard-codes the popup card as white with #333 text, but everything
+     we render inside it is themed. In dark mode that put a dark-inheriting
+     name on a var(--bg) panel - invisible. Theme the chrome itself and the
+     whole card follows, rather than colouring each line defensively. */
+  .leaflet-popup-content-wrapper,
+  .leaflet-popup-tip {
+    background: var(--panel);
+    color: var(--ink);
+  }
+  .leaflet-container a.leaflet-popup-close-button { color: var(--muted); }
+
   .popup h3 { margin: 0 0 2px; font-size: 15px; }
   .popup .sb { color: var(--muted); font-size: 13px; }
   .popup .contact {
