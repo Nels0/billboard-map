@@ -23,14 +23,56 @@ OUT = ROOT / "data" / "responses.csv"
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
 
 
-def credentials():
+def key_material() -> dict:
     raw = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
     if not raw:
         sys.exit("GOOGLE_SERVICE_ACCOUNT_JSON is not set.")
     if not raw.lstrip().startswith("{"):
         raw = Path(raw).read_text(encoding="utf-8")
-    return service_account.Credentials.from_service_account_info(
-        json.loads(raw), scopes=SCOPES
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        sys.exit(f"GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON: {exc}")
+
+
+def credentials(info: dict):
+    return service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
+
+
+def explain_failure(response, info: dict) -> str:
+    """Turn Google's 403 into the specific thing that needs fixing.
+
+    The two causes look identical from the status code alone, so the response
+    body is the only way to tell them apart.
+    """
+    email = info.get("client_email", "(unknown)")
+    project = info.get("project_id", "(unknown)")
+    try:
+        error = response.json().get("error", {})
+    except ValueError:
+        error = {}
+    message = error.get("message", response.text[:400])
+    reasons = {d.get("reason") for d in error.get("details", []) if isinstance(d, dict)}
+
+    if "SERVICE_DISABLED" in reasons or "has not been used in project" in message:
+        return (
+            "The Sheets API is not enabled on the service account's project.\n"
+            f"  project: {project}\n"
+            "  enable it: https://console.developers.google.com/apis/api/"
+            f"sheets.googleapis.com/overview?project={project}\n"
+            "  (then wait a minute for it to propagate)\n\n"
+            f"Google said: {message}"
+        )
+
+    return (
+        "The service account cannot read this sheet.\n"
+        f"  service account: {email}\n"
+        "  Open the sheet -> Share -> paste that address -> Viewer.\n"
+        "  It must be shared with the service account itself; sharing with your\n"
+        "  own Google account does not grant it access.\n"
+        "  If you only have view access and cannot share it onward, copy the\n"
+        "  data into your own sheet with =IMPORTRANGE(...) and point SHEET_ID there.\n\n"
+        f"Google said: {message}"
     )
 
 
@@ -40,7 +82,10 @@ def main() -> None:
         sys.exit("SHEET_ID is not set.")
     cell_range = os.environ.get("SHEET_RANGE", "A:Z")
 
-    creds = credentials()
+    info = key_material()
+    print(f"authenticating as {info.get('client_email', '?')}")
+
+    creds = credentials(info)
     creds.refresh(google.auth.transport.requests.Request())
 
     session = google.auth.transport.requests.AuthorizedSession(creds)
@@ -49,6 +94,14 @@ def main() -> None:
         f"/values/{cell_range}"
     )
     response = session.get(url, params={"majorDimension": "ROWS"})
+
+    if response.status_code == 403:
+        sys.exit(explain_failure(response, info))
+    if response.status_code == 404:
+        sys.exit(
+            "No sheet with that id (404). SHEET_ID must be just the id from the "
+            "URL, the part between /d/ and /edit, not the whole URL."
+        )
     response.raise_for_status()
     rows = response.json().get("values", [])
     if not rows:
