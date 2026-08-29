@@ -17,12 +17,14 @@
     --low: #3b72c4;
     --warn: #b26a00;
     --accent: #1f6f4a;
+    --up: #b4600a;
+    --down: #15693f;
   }
   @media (prefers-color-scheme: dark) {
     :root {
       --bg: #14171a; --panel: #1c2126; --ink: #e9edf1; --muted: #97a2ae;
       --line: #2c333a; --high: #e8695e; --low: #6699e0; --warn: #e0a341;
-      --accent: #4dab7d;
+      --accent: #4dab7d; --up: #f0a355; --down: #4fb07f;
     }
   }
   * { box-sizing: border-box; }
@@ -114,14 +116,19 @@
   /* ---- sign status ---- */
   /* Priority keeps the fill colour, so state rides on the ring and the fill
      opacity instead: a pin answers "how urgent" and "is it up yet" at once. */
-  .seg[hidden] { display: none; }
+  .field { display: grid; gap: 5px; }
+  .field[hidden] { display: none; }
+  .lbl {
+    font-size: 11px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: .06em; color: var(--muted);
+  }
   .st {
     font-size: 10.5px; font-weight: 700; padding: 1px 6px; border-radius: 4px;
     text-transform: uppercase; letter-spacing: .04em; flex: none;
     border: 1px solid currentColor;
   }
-  .st.up { color: var(--accent); }
-  .st.down { color: var(--muted); }
+  .st.up { color: var(--up); }
+  .st.down { color: var(--down); }
   .st.odd { color: var(--warn); }
   .item.pending { opacity: .5; }
 
@@ -223,18 +230,24 @@
       <button id="dismiss" type="button">Close</button>
     </header>
     <div class="controls">
-      <div class="seg" id="prio">
-        <button data-p="all" class="on">All</button>
-        <button data-p="high">High</button>
-        <button data-p="low">Low</button>
+      <div class="field">
+        <span class="lbl">Priority</span>
+        <div class="seg" id="prio">
+          <button data-p="all" class="on">All</button>
+          <button data-p="high">High</button>
+          <button data-p="low">Low</button>
+        </div>
       </div>
       <!-- Revealed only once status tracking is configured, or once the baked
            snapshot carries at least one state. -->
-      <div class="seg" id="stateSeg" hidden>
-        <button data-s="all" class="on">All</button>
-        <button data-s="up">Up</button>
-        <button data-s="down">Down</button>
-        <button data-s="unset">Unset</button>
+      <div class="field" id="stateField" hidden>
+        <span class="lbl">Sign status</span>
+        <div class="seg" id="stateSeg">
+          <button data-s="all" class="on">All</button>
+          <button data-s="up">Up</button>
+          <button data-s="down">Down</button>
+          <button data-s="unset">Unset</button>
+        </div>
       </div>
       <select id="suburb"><option value="">All suburbs</option></select>
       <input type="search" id="search" placeholder="Search street or notes…">
@@ -330,7 +343,6 @@
   if (saved) attempt(saved, true).catch(function () { store(null, false); });
 
   /* ---------- map ---------- */
-  function colour(f) { return f.properties.priority === "high" ? "#d1493f" : "#3b72c4"; }
   function needsReview(f) {
     return f.properties.confidence !== "exact";
   }
@@ -351,18 +363,28 @@
     return state === "up" ? "up" : state === "down" ? "down" : "odd";
   }
 
-  // Priority owns the fill colour. State rides on the ring and the fill
-  // opacity: up is ringed and solid, down is washed out, unset looks as it
-  // always did. The ring green is a fixed hex, not var(--accent), because it
-  // sits on map tiles rather than on the page background.
+  // Sign status owns the fill, priority the ring. Fixed hexes rather than the
+  // theme variables, because pins sit on map tiles that are light in both
+  // schemes.
+  //
+  // The greens and oranges are deliberately far apart in lightness as well as
+  // hue: orange and green at matching luminance are close to indistinguishable
+  // with red-green colour blindness, and up-versus-down is the read this map
+  // exists to answer. As chosen they differ 3.1:1 in luminance, so they stay
+  // apart in greyscale too.
+  var STATUS_FILL = { up: "#f59e2c", down: "#15693f", unset: "#9ba1a9" };
+  // Deeper than the list pills: a ring only a few pixels wide has to hold its
+  // own against the fill it encloses, where --high/--low managed only 1.3:1.
+  var PRIORITY_RING = { high: "#b3271c", low: "#1d4f9e" };
+
   function markerStyle(f) {
-    var state = f.properties.state;
+    var p = f.properties;
     return {
-      radius: f.properties.priority === "high" ? 8 : 6,
-      color: state === "up" ? "#0f7a45" : "#ffffff",
-      weight: state === "up" ? 3 : 2,
-      fillColor: colour(f),
-      fillOpacity: state === "down" ? 0.2 : 0.9
+      radius: p.priority === "high" ? 8 : 6,
+      color: PRIORITY_RING[p.priority] || PRIORITY_RING.low,
+      weight: 3,
+      fillColor: STATUS_FILL[bucket(p.state)],
+      fillOpacity: 0.95
     };
   }
 
@@ -711,7 +733,7 @@
     sync.cfg = (data.status && data.status.endpoint && data.status.token)
       ? data.status : null;
     var anyState = data.geojson.features.some(function (f) { return !!f.properties.state; });
-    if (sync.cfg || anyState) document.getElementById("stateSeg").hidden = false;
+    if (sync.cfg || anyState) document.getElementById("stateField").hidden = false;
 
     map = L.map("map", { zoomControl: true }).setView([-41.31, 174.78], 13);
     L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
