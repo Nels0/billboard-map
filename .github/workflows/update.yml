@@ -1,8 +1,12 @@
 name: Update map
 
 on:
+  # Deliberately :23 and not :00. GitHub runs scheduled workflows on a shared
+  # best-effort queue: when it is congested runs are silently dropped, not
+  # merely delayed, and :00 is the most contended minute of the hour. At :00
+  # this workflow delivered 3 of 16 expected runs, each 37-46 min late.
   schedule:
-    - cron: "0 */1 * * *"   # every hour
+    - cron: "23 * * * *"
   workflow_dispatch:
   push:
     branches: [main]
