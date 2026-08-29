@@ -54,6 +54,19 @@ jobs:
           SHEET_TAB: ${{ vars.SHEET_TAB }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
 
+      # Fallback copy of the up/down state for when the browser cannot reach
+      # the Apps Script endpoint. Never fatal: an unreachable status sheet
+      # warns and yields an empty snapshot rather than failing the map build.
+      - name: Fetch billboard status
+        run: python scripts/fetch_status.py
+        env:
+          # Unset falls back to SHEET_ID, for status tabs kept in the response
+          # spreadsheet rather than one of their own.
+          STATUS_SHEET_ID: ${{ secrets.STATUS_SHEET_ID }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          STATUS_TAB: ${{ vars.STATUS_TAB }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+
       - name: Normalise
         run: python scripts/normalise.py
 
@@ -64,6 +77,11 @@ jobs:
         run: python scripts/build_site.py
         env:
           MAP_PASSPHRASE: ${{ secrets.MAP_PASSPHRASE }}
+          # Baked into the encrypted payload, not into index.html: the
+          # deployment URL plus token is a bearer capability to write status,
+          # so it sits behind the passphrase like everything else.
+          STATUS_ENDPOINT: ${{ secrets.STATUS_ENDPOINT }}
+          STATUS_TOKEN: ${{ secrets.STATUS_TOKEN }}
 
       - name: Re-encrypt geocode cache
         run: python scripts/crypto_util.py encrypt build/geocode-cache.plain.json cache.enc.json

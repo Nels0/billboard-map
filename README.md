@@ -21,7 +21,16 @@ Google Sheet ──(service account, read-only)──▶ fetch_sheet.py
                                      GitHub Pages ──▶ site/index.html
                                                        prompts for passphrase,
                                                        decrypts in the browser
+                                                            ▲
+                                                            │ live, read/write
+                                                            ▼
+status tab ◀──▶ Apps Script web app ──────────────── up / down state only
 ```
+
+Addresses travel the slow path on the left: a scheduled rebuild that geocodes,
+encrypts and republishes. Mutable state travels the fast path on the right,
+straight between the browser and a small endpoint, and carries nothing but a
+record id and a status. The two are joined in the browser at render time.
 
 Nothing readable is ever committed. The repository is public — a requirement for
 free GitHub Pages — so the geocode cache is stored as AES-256-GCM ciphertext, and
@@ -65,6 +74,48 @@ filter isolates them for a cleanup pass. Fix those at the source and the next ru
 picks them up. Results are cached by a hash of the address, so a scheduled run
 only geocodes genuinely new entries.
 
+## Tracking status
+
+Whether a sign is actually up is the one field that changes hourly and that the
+people in the field, not the form, are the authority on. It therefore does not
+travel through the rebuild at all.
+
+A second spreadsheet tab holds one row per address — a record id, the address in
+plain text, a state, and who set it when. An Apps Script web app bound to that
+spreadsheet reads and writes it; the map calls that endpoint directly. A separate
+append-only tab logs every write, so "who marked this up, and when" has an answer
+after a sign goes missing.
+
+Three properties are worth keeping if this is adapted:
+
+- **The endpoint URL and its token live inside the encrypted payload**, not in
+  `index.html`. A deployment URL plus token is a bearer capability to write, so
+  it belongs behind the same passphrase as the addresses rather than being served
+  in the clear to every visitor.
+- **The build bakes in a snapshot** of the status tab as a fallback. If the
+  endpoint is unreachable the map shows last-known state and says so, rather than
+  blanking every pin — a pin with no status reads as "nobody has been here yet",
+  which is a lie that sends someone to the same address twice.
+- **Writes are optimistic and reversible.** The state applies on tap and reverts
+  with a visible message if the endpoint rejects it, because a field team on
+  mobile data should not wait on a round trip per tap.
+
+The endpoint keys on a hash of street and suburb, the same id the rest of the
+pipeline uses. Correcting an address in the source form therefore mints a new id
+and strands the old status row, so `build_site.py` reports rows matching no
+current record instead of dropping them quietly; the address is stored in plain
+text alongside the id precisely so a human can re-key one.
+
+Two constraints come from Apps Script itself, and both are easy to trip over.
+Web apps do not answer CORS preflight requests, so calls from the page must stay
+"simple": no custom headers, which is why the token travels in the query string
+and the request body, and why the POST is sent as `text/plain` despite carrying
+JSON. And re-deploying the script issues a **new URL**, so the endpoint secret
+has to be updated whenever the script changes.
+
+Everything degrades: with no endpoint configured the map still shows whatever
+status the last build baked in, as a read-only field.
+
 ## Privacy
 
 This carries personal information — names, phone numbers, email addresses and
@@ -80,6 +131,13 @@ home addresses. The design follows from that:
   it.
 - Free-text fields are rendered through an HTML-escaping helper, since they
   arrive from a public form.
+
+- Status tracking makes the passphrase a **write** credential as well as a read
+  one: anyone who can open the map can mark a sign up or down. That matches the
+  trust model — they can already see every address and phone number — and the
+  realistic failure is vandalism rather than disclosure, which the append-only
+  log makes visible and reversible. The endpoint token can also be rotated
+  independently of the passphrase.
 
 **Limits of the passphrase model.** One shared secret protects everyone. There is
 no per-person revocation — removing someone's access means changing the
@@ -142,6 +200,22 @@ whatever that step could see.
 5. **Settings → Pages → Source: GitHub Actions.**
 6. Run the **Update map** workflow once to seed the cache.
 
+**Status tracking is optional** and can be added later; without it the map builds
+and runs exactly as before.
+
+7. Add two tabs — `status` and `status_log` — with the header rows named in
+   `scripts/apps_script/Code.gs`. They can live in the response spreadsheet or
+   in one of their own; a separate spreadsheet is the safer default, because a
+   container-bound script can then be authorised under the `spreadsheets`
+   `currentonly` scope and cannot reach the sheet holding contact details.
+8. Extensions → Apps Script, paste `scripts/apps_script/Code.gs`, and set a
+   Script Property `WRITE_TOKEN` to a long random string. It is deliberately not
+   in the file, which is committed to a public repository.
+9. Deploy → New deployment → Web app, executing as you, accessible to anyone
+   with the link. Copy the `/exec` URL.
+10. Add secrets `STATUS_ENDPOINT` (that URL) and `STATUS_TOKEN` (the property),
+    plus `STATUS_SHEET_ID` if the tabs are not in the response spreadsheet.
+
 Changing `MAP_PASSPHRASE` later requires deleting `cache.enc.json` in the same
 commit, since the old cache can no longer be decrypted.
 
@@ -153,9 +227,16 @@ export MAP_PASSPHRASE='…'
 
 python scripts/normalise.py            # data/responses.csv → build/records.plain.json
 python scripts/geocode.py              # adds build/geocode-cache.plain.json
+python scripts/fetch_status.py         # optional; → build/status.plain.json
 python scripts/build_site.py           # → site/data.enc.json
 python -m http.server -d site 8000     # open http://localhost:8000
 ```
+
+`fetch_status.py` writes an empty snapshot and exits cleanly when no status
+sheet is configured, and warns rather than failing when one is configured but
+unreachable — a missing fallback must never break the map build. Set
+`STATUS_ENDPOINT` and `STATUS_TOKEN` before `build_site.py` to exercise the live
+path locally.
 
 `build/`, `data/` and `site/data.enc.json` are gitignored; they are the only
 places plaintext or locally-keyed data exists. Use a throwaway passphrase

@@ -70,6 +70,7 @@
   header.bar { padding: 14px 16px 10px; border-bottom: 1px solid var(--line); }
   header.bar h1 { font-size: 16px; margin: 0 0 2px; }
   header.bar .sub { font-size: 12.5px; color: var(--muted); }
+  header.bar .stat { font-size: 12px; color: var(--muted); margin-top: 3px; }
 
   .controls { padding: 12px 16px; border-bottom: 1px solid var(--line); display: grid; gap: 10px; }
   .seg { display: flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
@@ -109,6 +110,40 @@
   .pill.high { background: var(--high); }
   .pill.low { background: var(--low); }
   .flag { color: var(--warn); font-weight: 600; }
+
+  /* ---- sign status ---- */
+  /* Priority keeps the fill colour, so state rides on the ring and the fill
+     opacity instead: a pin answers "how urgent" and "is it up yet" at once. */
+  .seg[hidden] { display: none; }
+  .st {
+    font-size: 10.5px; font-weight: 700; padding: 1px 6px; border-radius: 4px;
+    text-transform: uppercase; letter-spacing: .04em; flex: none;
+    border: 1px solid currentColor;
+  }
+  .st.up { color: var(--accent); }
+  .st.down { color: var(--muted); }
+  .st.odd { color: var(--warn); }
+  .item.pending { opacity: .5; }
+
+  .popup .status { margin-top: 9px; padding-top: 8px; border-top: 1px solid var(--line); }
+  .popup .status .cur { font-size: 13px; margin-bottom: 7px; }
+  .popup .status .cur .meta { color: var(--muted); font-size: 12px; }
+  .popup .acts { display: flex; gap: 6px; }
+  .popup .acts button {
+    flex: 1; padding: 7px 4px; font-size: 12.5px; font-weight: 600; cursor: pointer;
+    border: 1px solid var(--line); border-radius: 7px;
+    background: var(--panel); color: var(--ink);
+  }
+  .popup .acts button.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .popup .acts button[disabled] { opacity: .5; cursor: progress; }
+
+  #toast {
+    position: fixed; z-index: 3000; left: 50%; bottom: 24px; transform: translateX(-50%);
+    max-width: min(420px, calc(100vw - 32px)); padding: 10px 15px; border-radius: 8px;
+    background: var(--ink); color: var(--bg); font-size: 13.5px; font-weight: 600;
+    box-shadow: 0 4px 16px rgba(0,0,0,.3); display: none;
+  }
+  #toast.show { display: block; }
 
   .popup h3 { margin: 0 0 2px; font-size: 15px; }
   .popup .sb { color: var(--muted); font-size: 13px; }
@@ -172,6 +207,7 @@
       <div class="titles">
         <h1>Billboard requests</h1>
         <div class="sub" id="generated"></div>
+        <div class="stat" id="statusline"></div>
       </div>
       <button id="dismiss" type="button">Close</button>
     </header>
@@ -180,6 +216,14 @@
         <button data-p="all" class="on">All</button>
         <button data-p="high">High</button>
         <button data-p="low">Low</button>
+      </div>
+      <!-- Revealed only once status tracking is configured, or once the baked
+           snapshot carries at least one state. -->
+      <div class="seg" id="stateSeg" hidden>
+        <button data-s="all" class="on">All</button>
+        <button data-s="up">Up</button>
+        <button data-s="down">Down</button>
+        <button data-s="unset">Unset</button>
       </div>
       <select id="suburb"><option value="">All suburbs</option></select>
       <input type="search" id="search" placeholder="Search street or notes…">
@@ -191,14 +235,22 @@
   <div id="map"></div>
 </div>
 <button id="toggle">List</button>
+<div id="toast" role="status" aria-live="polite"></div>
 
 <script src="vendor/leaflet.js"></script>
 <script>
 (function () {
   "use strict";
   var KEY = "wlb26-map-pass";
-  var data = null, map = null, layer = null, markers = {};
-  var filters = { priority: "all", suburb: "", q: "", review: false };
+  var WHO = "wlb26-map-who";
+  var data = null, map = null, layer = null, markers = {}, listEls = {};
+  var byId = {};        // id -> feature; status updates mutate these in place
+  var pending = {};     // id -> true while a status write is in flight
+  // cfg is null until status tracking is configured; live says whether the
+  // endpoint answered, which is the difference between "3 down" and "3 down as
+  // of the last build".
+  var sync = { cfg: null, live: false, error: "" };
+  var filters = { priority: "all", suburb: "", q: "", review: false, state: "all" };
 
   /* ---------- crypto ---------- */
   function b64(s) {
@@ -272,6 +324,226 @@
     return f.properties.confidence !== "exact";
   }
 
+  /* ---------- sign status ---------- */
+
+  // A hand-edited sheet can hold anything, so only the two known values get
+  // their own bucket. Anything else falls in with "unset", which is the pile
+  // someone still has to deal with - exactly where a typo belongs.
+  function bucket(state) {
+    return state === "up" ? "up" : state === "down" ? "down" : "unset";
+  }
+
+  // Colouring, unlike filtering, keeps unrecognised values distinct: they
+  // belong in the "unset" pile to work through, but they should look like the
+  // sheet typo they are rather than like an address nobody has reached yet.
+  function chipClass(state) {
+    return state === "up" ? "up" : state === "down" ? "down" : "odd";
+  }
+
+  // Priority owns the fill colour. State rides on the ring and the fill
+  // opacity: up is ringed and solid, down is washed out, unset looks as it
+  // always did. The ring green is a fixed hex, not var(--accent), because it
+  // sits on map tiles rather than on the page background.
+  function markerStyle(f) {
+    var state = f.properties.state;
+    return {
+      radius: f.properties.priority === "high" ? 8 : 6,
+      color: state === "up" ? "#0f7a45" : "#ffffff",
+      weight: state === "up" ? 3 : 2,
+      fillColor: colour(f),
+      fillOpacity: state === "down" ? 0.2 : 0.9
+    };
+  }
+
+  function shortDate(iso) {
+    var d = new Date(iso);
+    if (isNaN(d.getTime())) return iso;
+    return d.toLocaleDateString(undefined, { day: "numeric", month: "short" }) +
+      " " + d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+  }
+
+  function actionButton(id, act, text, on, busy) {
+    return '<button type="button" data-id="' + esc(id) + '" data-act="' + esc(act) +
+      '"' + (on ? ' class="on"' : "") + (busy ? " disabled" : "") + ">" + esc(text) +
+      "</button>";
+  }
+
+  function statusBlock(f) {
+    var p = f.properties;
+    var state = p.state;
+    var label = state === "up" ? "Up"
+      : state === "down" ? "Down"
+      : state ? esc(state) + " (unrecognised)"
+      : "Not set";
+
+    var meta = [];
+    if (p.state_by) meta.push("by " + esc(p.state_by));
+    if (p.state_updated) meta.push(esc(shortDate(p.state_updated)));
+
+    var html = '<div class="status"><div class="cur">Sign: <b>' + label + "</b>" +
+      (meta.length ? ' <span class="meta">' + meta.join(" · ") + "</span>" : "") +
+      "</div>";
+
+    // Buttons only exist when there is somewhere to write to. Without an
+    // endpoint the card still reports the state baked in at build time.
+    if (sync.cfg) {
+      var busy = !!pending[p.id];
+      html += '<div class="acts">' +
+        actionButton(p.id, "up", "Mark up", state === "up", busy) +
+        actionButton(p.id, "down", "Mark down", state === "down", busy) +
+        actionButton(p.id, "", "Clear", false, busy) +
+        "</div>";
+    }
+    return html + "</div>";
+  }
+
+  function itemHTML(f) {
+    var p = f.properties;
+    return '<span class="addr">' + esc(p.street) + "</span>" +
+      (p.state ? '<span class="st ' + chipClass(p.state) + '">' + esc(p.state) + "</span>" : "") +
+      '<span class="pill ' + esc(p.priority) + '">' + esc(p.priority) + "</span>";
+  }
+
+  var toastTimer = null;
+  function toast(message) {
+    var el = document.getElementById("toast");
+    el.textContent = message;
+    el.classList.add("show");
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () { el.classList.remove("show"); }, 6000);
+  }
+
+  // Asked once and remembered. This is a courtesy label for the log, not
+  // identity - the passphrase is the only thing that actually authorises.
+  function who() {
+    var name = null;
+    try { name = localStorage.getItem(WHO); } catch (e) {}
+    if (!name) {
+      name = (window.prompt("Your name (recorded against status changes):") || "").trim();
+      if (name) { try { localStorage.setItem(WHO, name); } catch (e) {} }
+    }
+    return name || "unknown";
+  }
+
+  function updateStatusLine() {
+    var el = document.getElementById("statusline");
+    var up = 0, down = 0;
+    data.geojson.features.forEach(function (f) {
+      if (f.properties.state === "up") up++;
+      else if (f.properties.state === "down") down++;
+    });
+
+    if (!sync.cfg && !up && !down) { el.textContent = ""; return; }
+    var source = !sync.cfg ? "read-only"
+      : sync.live ? "live"
+      : "offline — as at " + data.generated;
+    el.textContent = up + " up · " + down + " down · " + source;
+  }
+
+  /* Apps Script web apps do not answer a CORS preflight, so both calls have to
+     stay "simple" requests: no custom headers, which is why the token travels
+     in the query string and the body rather than in an Authorization header,
+     and why the POST is sent as text/plain despite carrying JSON. */
+
+  function fetchStates() {
+    if (!sync.cfg) return Promise.resolve(false);
+    return fetch(sync.cfg.endpoint + "?token=" + encodeURIComponent(sync.cfg.token),
+                 { cache: "no-store" })
+      .then(function (r) {
+        if (!r.ok) throw new Error("endpoint returned " + r.status);
+        return r.json();
+      })
+      .then(function (res) {
+        if (!res || !res.ok) throw new Error((res && res.error) || "rejected");
+        Object.keys(res.states || {}).forEach(function (id) {
+          var f = byId[id];
+          if (!f) return;   // a status row for an address no longer in the form
+          var s = res.states[id];
+          f.properties.state = s.state || "";
+          f.properties.state_updated = s.updated || "";
+          f.properties.state_by = s.by || "";
+          f.properties.state_note = s.note || "";
+        });
+        sync.live = true;
+        return true;
+      })
+      .catch(function (err) {
+        // Keep the baked snapshot rather than blanking every pin: a pin with no
+        // status reads as "nobody has been here yet", which is a lie that sends
+        // someone to the same address twice.
+        sync.live = false;
+        sync.error = err.message;
+        return false;
+      });
+  }
+
+  function post(body) {
+    body.token = sync.cfg.token;
+    return fetch(sync.cfg.endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      body: JSON.stringify(body)
+    }).then(function (r) {
+      if (!r.ok) throw new Error("endpoint returned " + r.status);
+      return r.json();
+    }).then(function (res) {
+      if (!res || !res.ok) throw new Error((res && res.error) || "rejected");
+      return res;
+    });
+  }
+
+  // Repaint one record without rebuilding the map, so the open card stays open
+  // and the list keeps its scroll position. Falls back to a full render when
+  // the new state means the record no longer passes the filters.
+  function refreshOne(id) {
+    var f = byId[id];
+    if (!f) return;
+    if (!markers[id] || !passes(f)) { render(); return; }
+    markers[id].setStyle(markerStyle(f));
+    markers[id].setPopupContent(popup(f));
+    var el = listEls[id];
+    if (el) {
+      el.innerHTML = itemHTML(f);
+      el.classList.toggle("pending", !!pending[id]);
+    }
+    updateStatusLine();
+  }
+
+  function setState(id, next) {
+    var f = byId[id];
+    if (!f || !sync.cfg || pending[id]) return;
+    var p = f.properties;
+    if (p.state === next) return;
+
+    var before = { state: p.state, updated: p.state_updated, by: p.state_by };
+    var name = who();
+
+    // Optimistic: the field team is on mobile data, and waiting a second per
+    // tap for a round trip makes the map feel broken.
+    pending[id] = true;
+    p.state = next;
+    p.state_updated = new Date().toISOString();
+    p.state_by = name;
+    refreshOne(id);
+
+    post({
+      id: id, street: p.street, suburb: p.suburb,
+      state: next, by: name, note: p.state_note || ""
+    }).then(function (res) {
+      pending[id] = false;
+      p.state_updated = res.updated || p.state_updated;
+      sync.live = true;
+      refreshOne(id);
+    }).catch(function (err) {
+      pending[id] = false;
+      p.state = before.state;
+      p.state_updated = before.updated;
+      p.state_by = before.by;
+      refreshOne(id);
+      toast("Could not save that change: " + err.message);
+    });
+  }
+
   // Sort within a suburb by street name, not by the leading house number, so
   // "9b Douglas" and "112 Ohiro" land under D and O rather than 9 and 112.
   function streetName(s) {
@@ -316,6 +588,10 @@
         return "<dt>" + esc(r[0]) + "</dt><dd>" + esc(r[1]) + "</dd>";
       }).join("") + "</dl>";
 
+    // Below the details, not above them: opening a card is a read, and the one
+    // control that writes should not sit where a thumb lands while scrolling.
+    html += statusBlock(f);
+
     // Geocoding quality is a caveat on the data, not a headline: it sits last,
     // next to the raw match it is a caveat about.
     if (needsReview(f)) {
@@ -331,9 +607,10 @@
     if (filters.priority !== "all" && p.priority !== filters.priority) return false;
     if (filters.suburb && p.suburb !== filters.suburb) return false;
     if (filters.review && !needsReview(f)) return false;
+    if (filters.state !== "all" && bucket(p.state) !== filters.state) return false;
     if (filters.q) {
       var hay = (p.street + " " + p.suburb + " " + p.name + " " + p.email + " " +
-        p.notes + " " + p.mounting).toLowerCase();
+        p.notes + " " + p.mounting + " " + p.state + " " + p.state_by).toLowerCase();
       if (hay.indexOf(filters.q) === -1) return false;
     }
     return true;
@@ -343,16 +620,13 @@
     var shown = data.geojson.features.filter(passes);
     layer.clearLayers();
     markers = {};
+    listEls = {};
 
     shown.forEach(function (f) {
       var c = f.geometry.coordinates;
-      // Pins encode priority only. Match confidence is a caveat inside the
-      // card, not something worth reading the whole map through.
-      var m = L.circleMarker([c[1], c[0]], {
-        radius: f.properties.priority === "high" ? 8 : 6,
-        color: "#ffffff", weight: 2,
-        fillColor: colour(f), fillOpacity: 0.9
-      }).bindPopup(popup(f));
+      // Pins encode priority and sign status. Match confidence stays a caveat
+      // inside the card, not something worth reading the whole map through.
+      var m = L.circleMarker([c[1], c[0]], markerStyle(f)).bindPopup(popup(f));
       markers[f.properties.id] = m;
       layer.addLayer(m);
     });
@@ -390,9 +664,9 @@
       }).forEach(function (f) {
         var p = f.properties;
         var el = document.createElement("div");
-        el.className = "item";
-        el.innerHTML = '<span class="addr">' + esc(p.street) + "</span>" +
-          '<span class="pill ' + esc(p.priority) + '">' + esc(p.priority) + "</span>";
+        el.className = "item" + (pending[p.id] ? " pending" : "");
+        el.innerHTML = itemHTML(f);
+        listEls[p.id] = el;
         el.addEventListener("click", function () {
           var m = markers[p.id];
           map.setView(m.getLatLng(), 17);
@@ -418,6 +692,15 @@
   function start() {
     document.getElementById("generated").textContent =
       data.counts.mapped + " of " + data.counts.total + " mapped · updated " + data.generated;
+
+    data.geojson.features.forEach(function (f) { byId[f.properties.id] = f; });
+
+    // Endpoint and token ride inside the encrypted payload, so an unauthorised
+    // visitor never sees them. Absent, the map degrades to read-only status.
+    sync.cfg = (data.status && data.status.endpoint && data.status.token)
+      ? data.status : null;
+    var anyState = data.geojson.features.some(function (f) { return !!f.properties.state; });
+    if (sync.cfg || anyState) document.getElementById("stateSeg").hidden = false;
 
     map = L.map("map", { zoomControl: true }).setView([-41.31, 174.78], 13);
     L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
@@ -450,6 +733,22 @@
         render();
       });
     });
+    document.querySelectorAll("#stateSeg button").forEach(function (b) {
+      b.addEventListener("click", function () {
+        document.querySelectorAll("#stateSeg button").forEach(function (x) { x.classList.remove("on"); });
+        b.classList.add("on");
+        filters.state = b.dataset.s;
+        render();
+      });
+    });
+
+    // Delegated because popup markup is rebuilt as a string on every repaint.
+    // Opening a card never changes anything; only these buttons do.
+    document.addEventListener("click", function (e) {
+      var btn = e.target && e.target.closest && e.target.closest("[data-act]");
+      if (!btn) return;
+      setState(btn.getAttribute("data-id"), btn.getAttribute("data-act"));
+    });
     document.getElementById("toggle").addEventListener("click", function () {
       document.getElementById("side").classList.toggle("open");
     });
@@ -458,10 +757,19 @@
     });
 
     render();
+    updateStatusLine();
     var pts = data.geojson.features.map(function (f) {
       return [f.geometry.coordinates[1], f.geometry.coordinates[0]];
     });
     if (pts.length) map.fitBounds(pts, { padding: [40, 40] });
+
+    // Snapshot first so the map paints immediately; live status overlays it
+    // when it lands, typically alongside the key derivation that just ran.
+    fetchStates().then(function (ok) {
+      if (ok) render();
+      updateStatusLine();
+      if (!ok && sync.cfg) toast("Showing saved status — could not reach the status sheet.");
+    });
   }
 })();
 </script>

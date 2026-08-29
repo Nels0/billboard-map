@@ -7,8 +7,10 @@ build:
 	python3 scripts/build_site.py
 
 # Pull a fresh copy of the sheet first (needs SHEET_ID + service account).
+# fetch_status.py is a no-op unless STATUS_SHEET_ID or SHEET_ID is set.
 fetch:
 	python3 scripts/fetch_sheet.py
+	python3 scripts/fetch_status.py
 
 serve: build
 	@echo "http://localhost:8000"
