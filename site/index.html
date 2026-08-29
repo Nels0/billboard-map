@@ -17,14 +17,14 @@
     --low: #3b72c4;
     --warn: #b26a00;
     --accent: #1f6f4a;
-    --up: #b4600a;
-    --down: #15693f;
+    --up: #b45f09;
+    --down: #0d7a48;
   }
   @media (prefers-color-scheme: dark) {
     :root {
       --bg: #14171a; --panel: #1c2126; --ink: #e9edf1; --muted: #97a2ae;
       --line: #2c333a; --high: #e8695e; --low: #6699e0; --warn: #e0a341;
-      --accent: #4dab7d; --up: #f0a355; --down: #4fb07f;
+      --accent: #4dab7d; --up: #ffab5e; --down: #45d18d;
     }
   }
   * { box-sizing: border-box; }
@@ -144,6 +144,19 @@
   .popup .acts button.on { background: var(--accent); border-color: var(--accent); color: #fff; }
   .popup .acts button[disabled] { opacity: .5; cursor: progress; }
 
+  /* divIcon's default class paints a white box; passing our own replaces it. */
+  .pin { background: none; border: 0; }
+
+  #legend {
+    flex: none; border-top: 1px solid var(--line); padding: 9px 16px;
+    display: flex; flex-wrap: wrap; align-items: center; gap: 7px 14px;
+    font-size: 12px; color: var(--muted);
+  }
+  #legend[hidden] { display: none; }
+  #legend .k { display: flex; align-items: center; gap: 5px; }
+  #legend .k svg { display: block; flex: none; }
+  #legend .rule { flex-basis: 100%; height: 0; }
+
   #toast {
     position: fixed; z-index: 3000; left: 50%; bottom: 24px; transform: translateX(-50%);
     max-width: min(420px, calc(100vw - 32px)); padding: 10px 15px; border-radius: 8px;
@@ -255,6 +268,7 @@
     </div>
     <div id="count"></div>
     <div id="list"></div>
+    <div id="legend" hidden></div>
   </aside>
   <div id="map"></div>
 </div>
@@ -363,29 +377,71 @@
     return state === "up" ? "up" : state === "down" ? "down" : "odd";
   }
 
-  // Sign status owns the fill, priority the ring. Fixed hexes rather than the
-  // theme variables, because pins sit on map tiles that are light in both
-  // schemes.
-  //
-  // The greens and oranges are deliberately far apart in lightness as well as
-  // hue: orange and green at matching luminance are close to indistinguishable
-  // with red-green colour blindness, and up-versus-down is the read this map
-  // exists to answer. As chosen they differ 3.1:1 in luminance, so they stay
-  // apart in greyscale too.
-  var STATUS_FILL = { up: "#f59e2c", down: "#15693f", unset: "#9ba1a9" };
-  // Deeper than the list pills: a ring only a few pixels wide has to hold its
-  // own against the fill it encloses, where --high/--low managed only 1.3:1.
-  var PRIORITY_RING = { high: "#b3271c", low: "#1d4f9e" };
+  // Status is carried by SHAPE first and colour second. Shape survives any
+  // colour vision deficiency and a greyscale print, which frees the palette to
+  // be as bright as it likes - the earlier scheme had to trade saturation for
+  // luminance separation to stay readable, and looked muted for it.
+  var STATUS_SHAPE = { up: "triangle", unset: "circle", down: "square" };
+  var STATUS_FILL = { up: "#ff8a1f", down: "#12c26a", unset: "#aab2bd" };
+  var PRIORITY_RING = { high: "#e01b24", low: "#1a73e8" };
 
-  function markerStyle(f) {
+  // Leaflet computes a marker's z-index as (pixel y + zIndexOffset), and pixel
+  // y runs into the thousands, so the offsets have to be far larger than any
+  // plausible y to guarantee the stacking order rather than merely nudge it.
+  var STATUS_Z = { up: 3000000, unset: 2000000, down: 1000000 };
+
+  var PIN_SIZE = { high: 30, low: 24 };
+
+  // Drawn twice: a white halo underneath so the priority ring reads against
+  // whatever map tile is behind it, then the shape itself. The halo is what
+  // lets the ring and fill both stay saturated without muddying each other.
+  function shapeSVG(shape, size, fill, ring) {
+    var body;
+    if (shape === "triangle") body = '<polygon points="12,2.6 21.6,20 2.4,20"';
+    else if (shape === "square") body = '<rect x="4" y="4" width="16" height="16" rx="2"';
+    else body = '<circle cx="12" cy="12" r="8.2"';
+    return '<svg width="' + size + '" height="' + size + '" viewBox="0 0 24 24" ' +
+      'xmlns="http://www.w3.org/2000/svg" aria-hidden="true">' +
+      body + ' fill="none" stroke="#ffffff" stroke-width="5.5" stroke-linejoin="round"/>' +
+      body + ' fill="' + fill + '" stroke="' + ring + '" stroke-width="2.6" stroke-linejoin="round"/>' +
+      '</svg>';
+  }
+
+  function pinIcon(f) {
     var p = f.properties;
-    return {
-      radius: p.priority === "high" ? 8 : 6,
-      color: PRIORITY_RING[p.priority] || PRIORITY_RING.low,
-      weight: 3,
-      fillColor: STATUS_FILL[bucket(p.state)],
-      fillOpacity: 0.95
-    };
+    var key = bucket(p.state);
+    var size = PIN_SIZE[p.priority] || PIN_SIZE.low;
+    return L.divIcon({
+      className: "pin",
+      html: shapeSVG(STATUS_SHAPE[key], size, STATUS_FILL[key],
+                     PRIORITY_RING[p.priority] || PRIORITY_RING.low),
+      iconSize: [size, size],
+      iconAnchor: [size / 2, size / 2],
+      popupAnchor: [0, -size / 2]
+    });
+  }
+
+  function pinZ(f) { return STATUS_Z[bucket(f.properties.state)]; }
+
+  // Built from the same function that draws the pins, so the key cannot drift
+  // away from the map it describes.
+  function buildLegend(showStatus) {
+    var parts = [];
+    if (showStatus) {
+      [["up", "Up"], ["unset", "Not set"], ["down", "Down"]].forEach(function (kv) {
+        parts.push('<span class="k">' +
+          shapeSVG(STATUS_SHAPE[kv[0]], 18, STATUS_FILL[kv[0]], "#7c8592") +
+          esc(kv[1]) + "</span>");
+      });
+      parts.push('<span class="rule"></span>');
+    }
+    [["high", "High priority"], ["low", "Low priority"]].forEach(function (kv) {
+      parts.push('<span class="k">' +
+        shapeSVG("circle", 18, "#ffffff", PRIORITY_RING[kv[0]]) + esc(kv[1]) + "</span>");
+    });
+    var el = document.getElementById("legend");
+    el.innerHTML = parts.join("");
+    el.hidden = false;
   }
 
   function shortDate(iso) {
@@ -532,7 +588,8 @@
     var f = byId[id];
     if (!f) return;
     if (!markers[id] || !passes(f)) { render(); return; }
-    markers[id].setStyle(markerStyle(f));
+    markers[id].setIcon(pinIcon(f));
+    markers[id].setZIndexOffset(pinZ(f));
     markers[id].setPopupContent(popup(f));
     var el = listEls[id];
     if (el) {
@@ -657,9 +714,13 @@
 
     shown.forEach(function (f) {
       var c = f.geometry.coordinates;
-      // Pins encode priority and sign status. Match confidence stays a caveat
-      // inside the card, not something worth reading the whole map through.
-      var m = L.circleMarker([c[1], c[0]], markerStyle(f)).bindPopup(popup(f));
+      // Shape and fill encode sign status, the ring encodes priority, and the
+      // stacking order puts the ones already up above the ones still to do.
+      // Match confidence stays a caveat inside the card, not something worth
+      // reading the whole map through.
+      var m = L.marker([c[1], c[0]], {
+        icon: pinIcon(f), zIndexOffset: pinZ(f), keyboard: false
+      }).bindPopup(popup(f));
       markers[f.properties.id] = m;
       layer.addLayer(m);
     });
@@ -733,7 +794,9 @@
     sync.cfg = (data.status && data.status.endpoint && data.status.token)
       ? data.status : null;
     var anyState = data.geojson.features.some(function (f) { return !!f.properties.state; });
-    if (sync.cfg || anyState) document.getElementById("stateField").hidden = false;
+    var showStatus = !!(sync.cfg || anyState);
+    if (showStatus) document.getElementById("stateField").hidden = false;
+    buildLegend(showStatus);
 
     map = L.map("map", { zoomControl: true }).setView([-41.31, 174.78], 13);
     L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
