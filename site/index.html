@@ -1,0 +1,382 @@
+<!doctype html>
+<html lang="en-NZ">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex, nofollow">
+<title>WLB26 Billboard Map</title>
+<link rel="stylesheet" href="vendor/leaflet.css">
+<style>
+  :root {
+    --bg: #f6f7f9;
+    --panel: #ffffff;
+    --ink: #16191d;
+    --muted: #5c6672;
+    --line: #dfe3e8;
+    --high: #d1493f;
+    --low: #3b72c4;
+    --warn: #b26a00;
+    --accent: #1f6f4a;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14171a; --panel: #1c2126; --ink: #e9edf1; --muted: #97a2ae;
+      --line: #2c333a; --high: #e8695e; --low: #6699e0; --warn: #e0a341;
+      --accent: #4dab7d;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    color: var(--ink); background: var(--bg);
+  }
+
+  /* ---- passphrase gate ---- */
+  #gate {
+    position: fixed; inset: 0; z-index: 2000; display: grid; place-items: center;
+    background: var(--bg); padding: 24px;
+  }
+  #gate .card {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+    padding: 28px; width: min(400px, 100%); box-shadow: 0 8px 28px rgba(0,0,0,.10);
+  }
+  #gate h1 { font-size: 19px; margin: 0 0 6px; }
+  #gate p { color: var(--muted); font-size: 13.5px; margin: 0 0 18px; }
+  #gate input[type=password] {
+    width: 100%; padding: 11px 12px; font-size: 16px; border-radius: 8px;
+    border: 1px solid var(--line); background: var(--bg); color: var(--ink);
+  }
+  #gate button {
+    width: 100%; margin-top: 12px; padding: 11px; font-size: 15px; font-weight: 600;
+    border: 0; border-radius: 8px; background: var(--accent); color: #fff; cursor: pointer;
+  }
+  #gate button[disabled] { opacity: .6; cursor: progress; }
+  #gate label.remember {
+    display: flex; gap: 8px; align-items: center; margin-top: 14px;
+    font-size: 13px; color: var(--muted);
+  }
+  #gate .err { color: var(--high); font-size: 13.5px; margin-top: 12px; min-height: 1em; }
+
+  /* ---- layout ---- */
+  #app { display: none; height: 100%; grid-template-columns: 330px 1fr; }
+  #app.ready { display: grid; }
+  #side {
+    background: var(--panel); border-right: 1px solid var(--line);
+    display: flex; flex-direction: column; min-height: 0;
+  }
+  #map { height: 100%; }
+
+  header.bar { padding: 14px 16px 10px; border-bottom: 1px solid var(--line); }
+  header.bar h1 { font-size: 16px; margin: 0 0 2px; }
+  header.bar .sub { font-size: 12.5px; color: var(--muted); }
+
+  .controls { padding: 12px 16px; border-bottom: 1px solid var(--line); display: grid; gap: 10px; }
+  .seg { display: flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  .seg button {
+    flex: 1; padding: 8px 4px; font-size: 13px; border: 0; cursor: pointer;
+    background: transparent; color: var(--muted); font-weight: 600;
+  }
+  .seg button.on { background: var(--accent); color: #fff; }
+  select, .controls input[type=search] {
+    width: 100%; padding: 9px 10px; font-size: 14px; border-radius: 8px;
+    border: 1px solid var(--line); background: var(--bg); color: var(--ink);
+  }
+  label.check { display: flex; gap: 8px; align-items: center; font-size: 13px; color: var(--muted); }
+
+  #count { padding: 8px 16px; font-size: 12.5px; color: var(--muted); border-bottom: 1px solid var(--line); }
+  #list { overflow-y: auto; flex: 1; min-height: 0; }
+  .item { padding: 10px 16px; border-bottom: 1px solid var(--line); cursor: pointer; }
+  .item:hover { background: var(--bg); }
+  .item .addr { font-weight: 600; font-size: 14px; }
+  .item .meta { font-size: 12.5px; color: var(--muted); margin-top: 2px; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+  .dot.high { background: var(--high); } .dot.low { background: var(--low); }
+  .flag { color: var(--warn); font-weight: 600; }
+
+  .popup h3 { margin: 0 0 2px; font-size: 15px; }
+  .popup .sb { color: var(--muted); font-size: 13px; margin-bottom: 8px; }
+  .popup dl { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 3px 10px; font-size: 13px; }
+  .popup dt { color: var(--muted); }
+  .popup dd { margin: 0; }
+  .popup .review { margin-top: 8px; color: var(--warn); font-size: 12.5px; }
+
+  #toggle {
+    display: none; position: fixed; z-index: 1000; left: 12px; bottom: 12px;
+    padding: 11px 16px; border: 0; border-radius: 999px; background: var(--accent);
+    color: #fff; font-weight: 600; font-size: 14px; box-shadow: 0 3px 12px rgba(0,0,0,.28);
+  }
+  @media (max-width: 760px) {
+    #app.ready { grid-template-columns: 1fr; }
+    #side {
+      position: fixed; inset: 0; z-index: 1100; border-right: 0;
+      transform: translateY(100%); transition: transform .22s ease;
+    }
+    #side.open { transform: none; }
+    #toggle { display: block; }
+  }
+</style>
+</head>
+<body>
+
+<div id="gate">
+  <form class="card" id="gateForm">
+    <h1>WLB26 Billboard Map</h1>
+    <p>This map contains supporter addresses. Enter the shared passphrase to unlock it.</p>
+    <input type="password" id="pass" autocomplete="current-password" placeholder="Passphrase" autofocus>
+    <label class="remember"><input type="checkbox" id="remember" checked> Remember on this device</label>
+    <button type="submit" id="unlock">Unlock</button>
+    <div class="err" id="err"></div>
+  </form>
+</div>
+
+<div id="app">
+  <aside id="side">
+    <header class="bar">
+      <h1>Billboard requests</h1>
+      <div class="sub" id="generated"></div>
+    </header>
+    <div class="controls">
+      <div class="seg" id="prio">
+        <button data-p="all" class="on">All</button>
+        <button data-p="high">High</button>
+        <button data-p="low">Low</button>
+      </div>
+      <select id="suburb"><option value="">All suburbs</option></select>
+      <input type="search" id="search" placeholder="Search street or notes…">
+      <label class="check"><input type="checkbox" id="onlyReview"> Only ones needing review</label>
+    </div>
+    <div id="count"></div>
+    <div id="list"></div>
+  </aside>
+  <div id="map"></div>
+</div>
+<button id="toggle">List</button>
+
+<script src="vendor/leaflet.js"></script>
+<script>
+(function () {
+  "use strict";
+  var KEY = "wlb26-map-pass";
+  var data = null, map = null, layer = null, markers = {};
+  var filters = { priority: "all", suburb: "", q: "", review: false };
+
+  /* ---------- crypto ---------- */
+  function b64(s) {
+    var bin = atob(s), out = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+  async function decrypt(env, pass) {
+    var base = await crypto.subtle.importKey(
+      "raw", new TextEncoder().encode(pass), "PBKDF2", false, ["deriveKey"]);
+    var key = await crypto.subtle.deriveKey(
+      { name: "PBKDF2", salt: b64(env.salt), iterations: env.iterations, hash: "SHA-256" },
+      base, { name: "AES-GCM", length: 256 }, false, ["decrypt"]);
+    var plain = await crypto.subtle.decrypt(
+      { name: "AES-GCM", iv: b64(env.iv) }, key, b64(env.ct));
+    return JSON.parse(new TextDecoder().decode(plain));
+  }
+
+  function store(pass, on) {
+    try { on ? localStorage.setItem(KEY, pass) : localStorage.removeItem(KEY); } catch (e) {}
+  }
+  function stored() {
+    try { return localStorage.getItem(KEY); } catch (e) { return null; }
+  }
+
+  /* ---------- gate ---------- */
+  var gate = document.getElementById("gate"),
+      form = document.getElementById("gateForm"),
+      passInput = document.getElementById("pass"),
+      errBox = document.getElementById("err"),
+      unlockBtn = document.getElementById("unlock");
+
+  var envelope = fetch("data.enc.json", { cache: "no-store" }).then(function (r) {
+    if (!r.ok) throw new Error("could not load map data (" + r.status + ")");
+    return r.json();
+  });
+
+  async function attempt(pass, remember) {
+    var env = await envelope;
+    var payload = await decrypt(env, pass);   // throws if the passphrase is wrong
+    store(pass, remember);
+    data = payload;
+    gate.style.display = "none";
+    document.getElementById("app").classList.add("ready");
+    start();
+  }
+
+  form.addEventListener("submit", function (e) {
+    e.preventDefault();
+    errBox.textContent = "";
+    unlockBtn.disabled = true;
+    unlockBtn.textContent = "Unlocking…";
+    attempt(passInput.value, document.getElementById("remember").checked)
+      .catch(function (err) {
+        errBox.textContent = /load map data/.test(err.message)
+          ? err.message : "That passphrase didn't work.";
+        passInput.select();
+      })
+      .finally(function () {
+        unlockBtn.disabled = false;
+        unlockBtn.textContent = "Unlock";
+      });
+  });
+
+  var saved = stored();
+  if (saved) attempt(saved, true).catch(function () { store(null, false); });
+
+  /* ---------- map ---------- */
+  function colour(f) { return f.properties.priority === "high" ? "#d1493f" : "#3b72c4"; }
+  function needsReview(f) {
+    return f.properties.confidence !== "exact";
+  }
+
+  function esc(s) {
+    return String(s == null ? "" : s).replace(/[&<>"]/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c];
+    });
+  }
+
+  function popup(f) {
+    var p = f.properties;
+    var rows = [
+      ["Priority", p.priority], ["Property", p.property_type],
+      ["Sign goes", p.sign_location], ["Mounting", p.mounting],
+      ["Poster size", p.poster_size], ["Permission", p.permission],
+      ["Their home", p.is_home], ["Notes", p.notes]
+    ].filter(function (r) { return r[1]; });
+
+    var html = '<div class="popup"><h3>' + esc(p.street) + "</h3>" +
+      '<div class="sb">' + esc(p.suburb) + "</div><dl>" +
+      rows.map(function (r) {
+        return "<dt>" + esc(r[0]) + "</dt><dd>" + esc(r[1]) + "</dd>";
+      }).join("") + "</dl>";
+    if (needsReview(f)) {
+      html += '<div class="review">Approximate pin — matched at ' +
+        esc(p.confidence) + " level only.<br>OSM returned: " +
+        esc(p.matched.split(",").slice(0, 3).join(",")) +
+        "<br>Confirm the number on the ground.</div>";
+    }
+    return html + "</div>";
+  }
+
+  function passes(f) {
+    var p = f.properties;
+    if (filters.priority !== "all" && p.priority !== filters.priority) return false;
+    if (filters.suburb && p.suburb !== filters.suburb) return false;
+    if (filters.review && !needsReview(f)) return false;
+    if (filters.q) {
+      var hay = (p.street + " " + p.suburb + " " + p.notes + " " + p.mounting).toLowerCase();
+      if (hay.indexOf(filters.q) === -1) return false;
+    }
+    return true;
+  }
+
+  function render() {
+    var shown = data.geojson.features.filter(passes);
+    layer.clearLayers();
+    markers = {};
+
+    shown.forEach(function (f) {
+      var c = f.geometry.coordinates;
+      var m = L.circleMarker([c[1], c[0]], {
+        radius: f.properties.priority === "high" ? 8 : 6,
+        color: needsReview(f) ? "#b26a00" : "#ffffff",
+        weight: needsReview(f) ? 3 : 2,
+        dashArray: needsReview(f) ? "3 3" : null,
+        fillColor: colour(f), fillOpacity: 0.9
+      }).bindPopup(popup(f));
+      markers[f.properties.id] = m;
+      layer.addLayer(m);
+    });
+
+    var high = shown.filter(function (f) { return f.properties.priority === "high"; }).length;
+    var review = shown.filter(needsReview).length;
+    document.getElementById("count").textContent =
+      shown.length + " shown · " + high + " high priority" +
+      (review ? " · " + review + " need review" : "");
+
+    var list = document.getElementById("list");
+    list.innerHTML = "";
+    shown.slice().sort(function (a, b) {
+      return (a.properties.suburb + a.properties.street)
+        .localeCompare(b.properties.suburb + b.properties.street);
+    }).forEach(function (f) {
+      var p = f.properties;
+      var el = document.createElement("div");
+      el.className = "item";
+      el.innerHTML = '<div class="addr"><span class="dot ' + esc(p.priority) + '"></span>' +
+        esc(p.street) + "</div><div class=\"meta\">" + esc(p.suburb) +
+        (needsReview(f) ? ' · <span class="flag">check location</span>' : "") + "</div>";
+      el.addEventListener("click", function () {
+        var m = markers[p.id];
+        map.setView(m.getLatLng(), 17);
+        m.openPopup();
+        document.getElementById("side").classList.remove("open");
+      });
+      list.appendChild(el);
+    });
+
+    if (data.unplaced.length) {
+      var head = document.createElement("div");
+      head.className = "item";
+      head.style.cursor = "default";
+      head.innerHTML = '<div class="addr flag">' + data.unplaced.length +
+        " could not be placed</div><div class=\"meta\">" +
+        data.unplaced.map(function (u) { return esc(u.street + ", " + u.suburb); }).join("<br>") +
+        "</div>";
+      list.appendChild(head);
+    }
+  }
+
+  function start() {
+    document.getElementById("generated").textContent =
+      data.counts.mapped + " of " + data.counts.total + " mapped · updated " + data.generated;
+
+    map = L.map("map", { zoomControl: true }).setView([-41.31, 174.78], 13);
+    L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      maxZoom: 19,
+      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+    }).addTo(map);
+    layer = L.layerGroup().addTo(map);
+
+    var subs = {};
+    data.geojson.features.forEach(function (f) { subs[f.properties.suburb] = 1; });
+    var sel = document.getElementById("suburb");
+    Object.keys(subs).sort().forEach(function (s) {
+      var o = document.createElement("option");
+      o.value = o.textContent = s;
+      sel.appendChild(o);
+    });
+
+    sel.addEventListener("change", function () { filters.suburb = this.value; render(); });
+    document.getElementById("search").addEventListener("input", function () {
+      filters.q = this.value.trim().toLowerCase(); render();
+    });
+    document.getElementById("onlyReview").addEventListener("change", function () {
+      filters.review = this.checked; render();
+    });
+    document.querySelectorAll("#prio button").forEach(function (b) {
+      b.addEventListener("click", function () {
+        document.querySelectorAll("#prio button").forEach(function (x) { x.classList.remove("on"); });
+        b.classList.add("on");
+        filters.priority = b.dataset.p;
+        render();
+      });
+    });
+    document.getElementById("toggle").addEventListener("click", function () {
+      document.getElementById("side").classList.toggle("open");
+    });
+
+    render();
+    var pts = data.geojson.features.map(function (f) {
+      return [f.geometry.coordinates[1], f.geometry.coordinates[0]];
+    });
+    if (pts.length) map.fitBounds(pts, { padding: [40, 40] });
+  }
+})();
+</script>
+</body>
+</html>

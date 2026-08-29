@@ -1,0 +1,96 @@
+name: Update map
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"   # every six hours
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [site/**, scripts/**, .github/workflows/**]
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: update-map
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      MAP_PASSPHRASE: ${{ secrets.MAP_PASSPHRASE }}
+      SHEET_ID: ${{ secrets.SHEET_ID }}
+      GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      # The cache is committed encrypted, so restore it before geocoding.
+      - name: Restore geocode cache
+        run: python scripts/crypto_util.py decrypt cache.enc.json build/geocode-cache.plain.json
+
+      - name: Fetch sheet
+        run: python scripts/fetch_sheet.py
+
+      - name: Normalise
+        run: python scripts/normalise.py
+
+      - name: Geocode new addresses
+        run: python scripts/geocode.py
+
+      - name: Build encrypted map data
+        run: python scripts/build_site.py
+
+      - name: Re-encrypt geocode cache
+        run: python scripts/crypto_util.py encrypt build/geocode-cache.plain.json cache.enc.json
+
+      # Fails loudly rather than publishing addresses if an intermediate ever
+      # lands in site/. Only the encrypted envelope and static assets belong.
+      - name: Guard against plaintext in site/
+        run: |
+          python - <<'PY'
+          import json, sys
+          from pathlib import Path
+
+          allowed = {"data.enc.json", "index.html"}
+          strays = [
+              str(p) for p in Path("site").rglob("*")
+              if p.is_file()
+              and p.parent != Path("site/vendor")
+              and p.name not in allowed
+          ]
+          if strays:
+              sys.exit(f"unexpected file(s) under site/: {strays}")
+
+          env = json.loads(Path("site/data.enc.json").read_text())
+          missing = {"v", "salt", "iv", "ct"} - set(env)
+          if missing:
+              sys.exit(f"site/data.enc.json is not an envelope (missing {missing})")
+          if not isinstance(env["ct"], str) or len(env["ct"]) < 100:
+              sys.exit("site/data.enc.json ciphertext looks empty")
+          print(f"site/ clean; envelope OK ({len(env['ct'])} chars ciphertext)")
+          PY
+
+      - name: Commit updated data
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f site/data.enc.json cache.enc.json
+          git diff --staged --quiet || git commit -m "Update map data [skip ci]"
+          git push
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+      - id: deployment
+        uses: actions/deploy-pages@v4

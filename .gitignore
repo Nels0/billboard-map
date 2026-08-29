@@ -1,0 +1,21 @@
+# Raw response data — contains home addresses. Never commit.
+data/*.csv
+data/*.json
+!data/.gitkeep
+
+# Plaintext intermediates
+build/
+*.plain.json
+geocode-cache.json
+
+# Secrets
+.env
+service-account.json
+
+# Python
+__pycache__/
+*.pyc
+
+# Built map data. CI commits this with the real passphrase (git add -f);
+# never commit a locally-built copy, which uses a throwaway passphrase.
+site/data.enc.json
