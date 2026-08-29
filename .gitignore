@@ -1,0 +1,27 @@
+# Raw response data — contains home addresses. Never commit.
+data/*.csv
+data/*.json
+!data/.gitkeep
+
+# Plaintext intermediates
+build/
+*.plain.json
+geocode-cache.json
+
+# Secrets
+.env
+service-account.json
+
+# Deployment specifics: campaign identity, response counts, service account,
+# suburb list. Kept out of the public repo; the README stays generic.
+CLAUDE.md
+
+# Python
+__pycache__/
+*.pyc
+
+# Built map data. Never committed by anyone: CI publishes it to Pages via the
+# uploaded artifact instead. Staying untracked is what makes this ignore rule
+# effective — a tracked file is still picked up by `git add -A`, so a local
+# build with a throwaway passphrase could land on top of the real one.
+site/data.enc.json
