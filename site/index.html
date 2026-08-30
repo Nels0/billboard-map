@@ -73,6 +73,13 @@
   header.bar h1 { font-size: 16px; margin: 0 0 2px; }
   header.bar .sub { font-size: 12.5px; color: var(--muted); }
   header.bar .stat { font-size: 12px; color: var(--muted); margin-top: 3px; }
+  header.bar .stat .refresh {
+    margin-left: 7px; padding: 1px 7px; font: inherit; font-size: 11px;
+    color: var(--muted); background: none; border: 1px solid var(--line);
+    border-radius: 999px; cursor: pointer;
+  }
+  header.bar .stat .refresh:hover:not(:disabled) { color: var(--ink); }
+  header.bar .stat .refresh:disabled { opacity: .5; cursor: default; }
 
   .controls { padding: 12px 16px; border-bottom: 1px solid var(--line); display: grid; gap: 10px; }
   .seg { display: flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
@@ -286,8 +293,18 @@
   var pending = {};     // id -> true while a status write is in flight
   // cfg is null until status tracking is configured; live says whether the
   // endpoint answered, which is the difference between "3 down" and "3 down as
-  // of the last build".
-  var sync = { cfg: null, live: false, error: "" };
+  // of the last build". at/fails/timer drive the retry schedule: a phone that
+  // has been in a pocket for an hour comes back to a frozen timer and often a
+  // dead fetch, so the read has to be re-armed rather than left as it was.
+  var sync = { cfg: null, live: false, error: "", at: 0, fetching: false,
+               fails: 0, timer: null, changed: [] };
+  // Every read is an Apps Script execution and that has a daily runtime quota,
+  // so the idle poll is slow and the wake-up triggers do the real work.
+  var POLL_MS = 120000;       // background poll while the page is visible
+  var STALE_MS = 60000;       // older than this and a wake-up refetches at once
+  var RETRY_BASE_MS = 5000;   // first retry after a failure, doubling to the cap
+  var RETRY_MAX_MS = 60000;
+  var FETCH_TIMEOUT_MS = 12000;
   var filters = { priority: "all", suburb: "", q: "", review: false, state: "all" };
 
   /* ---------- crypto ---------- */
@@ -514,6 +531,15 @@
     return name || "unknown";
   }
 
+  function ago(ms) {
+    var sec = Math.round(ms / 1000);
+    if (sec < 90) return "just now";
+    var min = Math.round(sec / 60);
+    if (min < 60) return min + " min ago";
+    var hr = Math.round(min / 60);
+    return hr + (hr === 1 ? " hour ago" : " hours ago");
+  }
+
   function updateStatusLine() {
     var el = document.getElementById("statusline");
     var up = 0, down = 0;
@@ -523,10 +549,25 @@
     });
 
     if (!sync.cfg && !up && !down) { el.textContent = ""; return; }
-    var source = !sync.cfg ? "read-only"
-      : sync.live ? "live"
-      : "offline — as at " + data.generated;
+    // The age matters more than the word "live": someone acting on a reading
+    // taken an hour ago needs to see that it is an hour old.
+    var source;
+    if (!sync.cfg) source = "read-only";
+    else if (sync.fetching) source = "checking…";
+    else if (sync.live) source = "live · " + ago(Date.now() - sync.at);
+    else if (sync.at) source = "offline · last live " + ago(Date.now() - sync.at);
+    else source = "offline — as at " + data.generated;
+
     el.textContent = up + " up · " + down + " down · " + source;
+    if (!sync.cfg) return;
+    // Read-only, and deliberately separate from anything that writes.
+    var btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "refresh";
+    btn.textContent = "Refresh";
+    btn.disabled = !!sync.fetching;
+    btn.addEventListener("click", function () { refreshStates("manual"); });
+    el.appendChild(btn);
   }
 
   /* Apps Script web apps do not answer a CORS preflight, so both calls have to
@@ -536,34 +577,122 @@
 
   function fetchStates() {
     if (!sync.cfg) return Promise.resolve(false);
+    // A request left hanging on a flaky mobile connection never settles, which
+    // would pin sync.fetching true and stop every later retry. Cap it.
+    var ctl = window.AbortController ? new AbortController() : null;
+    var opts = { cache: "no-store" };
+    var timer = null;
+    if (ctl) {
+      opts.signal = ctl.signal;
+      timer = setTimeout(function () { ctl.abort(); }, FETCH_TIMEOUT_MS);
+    }
+    function settle(ok) { clearTimeout(timer); return ok; }
+
     return fetch(sync.cfg.endpoint + "?token=" + encodeURIComponent(sync.cfg.token),
-                 { cache: "no-store" })
+                 opts)
       .then(function (r) {
         if (!r.ok) throw new Error("endpoint returned " + r.status);
         return r.json();
       })
       .then(function (res) {
         if (!res || !res.ok) throw new Error((res && res.error) || "rejected");
+        var changed = [];
         Object.keys(res.states || {}).forEach(function (id) {
           var f = byId[id];
-          if (!f) return;   // a status row for an address no longer in the form
+          if (!f) return;       // a status row for an address no longer in the form
+          if (pending[id]) return;  // a write is in flight; its value is newer
           var s = res.states[id];
-          f.properties.state = s.state || "";
-          f.properties.state_updated = s.updated || "";
-          f.properties.state_by = s.by || "";
-          f.properties.state_note = s.note || "";
+          var next = {
+            state: s.state || "",
+            state_updated: s.updated || "",
+            state_by: s.by || "",
+            state_note: s.note || ""
+          };
+          var p = f.properties, dirty = false;
+          Object.keys(next).forEach(function (k) {
+            if (p[k] !== next[k]) { p[k] = next[k]; dirty = true; }
+          });
+          if (dirty) changed.push(id);
         });
+        sync.changed = changed;
         sync.live = true;
-        return true;
+        sync.at = Date.now();
+        sync.fails = 0;
+        sync.error = "";
+        return settle(true);
       })
       .catch(function (err) {
         // Keep the baked snapshot rather than blanking every pin: a pin with no
         // status reads as "nobody has been here yet", which is a lie that sends
         // someone to the same address twice.
         sync.live = false;
-        sync.error = err.message;
-        return false;
+        sync.fails++;
+        sync.error = err && err.name === "AbortError" ? "timed out" : err.message;
+        return settle(false);
       });
+  }
+
+  /* Nothing here re-arms itself on its own: a phone that sleeps for an hour
+     freezes the timer and usually kills the in-flight fetch, so the refresh is
+     driven by wake-up events as well as the timer, and any of them can fire. */
+
+  function scheduleRefresh(ms) {
+    clearTimeout(sync.timer);
+    if (!sync.cfg) return;
+    sync.timer = setTimeout(function () { refreshStates("timer"); }, ms);
+  }
+
+  // 5s, 10s, 20s, 40s, then a minute apart. sync.fails is already 1 on the
+  // first failure, hence the -1.
+  function retryDelay() {
+    var n = Math.min(Math.max(sync.fails - 1, 0), 4);
+    return Math.min(RETRY_MAX_MS, RETRY_BASE_MS * Math.pow(2, n));
+  }
+
+  function refreshStates(reason) {
+    if (!sync.cfg || sync.fetching) return Promise.resolve(false);
+    // A hidden page still gets its timer, but there is no point spending the
+    // request; wake-up will refetch anyway.
+    if (document.hidden && reason === "timer") {
+      scheduleRefresh(POLL_MS);
+      return Promise.resolve(false);
+    }
+    clearTimeout(sync.timer);
+    var wasLive = sync.live, hadData = sync.at > 0;
+    sync.fetching = true;
+    // Don't flash "checking…" over a reading that is still good — only when
+    // there is nothing current to show, or the user asked for this one.
+    if (!sync.live || reason === "manual") updateStatusLine();
+
+    return fetchStates().then(function (ok) {
+      sync.fetching = false;
+      if (ok) {
+        // A full render closes the open card, so only rebuild what moved —
+        // unless this is the first load, where there is nothing to disturb.
+        if (reason === "initial") render();
+        else sync.changed.forEach(refreshOne);
+      }
+      updateStatusLine();
+      scheduleRefresh(ok ? POLL_MS : retryDelay());
+      if (!ok && (wasLive || reason === "initial" || reason === "manual")) {
+        // sync.error is the only place the cause ever surfaces; a phone has
+        // no console to check.
+        var why = sync.error ? " (" + sync.error + ")" : "";
+        toast(hadData && reason !== "initial"
+          ? "Lost contact with the status sheet — retrying." + why
+          : "Showing saved status — could not reach the status sheet." + why);
+      } else if (ok && !wasLive && hadData) {
+        toast("Back in contact — status is live again.");
+      }
+      return ok;
+    });
+  }
+
+  // Used by every wake-up path: refetch only if what we are showing has had
+  // time to go stale, so a tab flick does not fire a request each time.
+  function maybeRefresh(reason) {
+    if (!sync.cfg || sync.fetching) return;
+    if (!sync.live || Date.now() - sync.at > STALE_MS) refreshStates(reason);
   }
 
   function post(body) {
@@ -859,13 +988,26 @@
     });
     if (pts.length) map.fitBounds(pts, { padding: [40, 40] });
 
+    // Wake-up triggers. Between them they cover a tab returning to the
+    // foreground, a bfcache restore (iOS Safari's usual way back), a network
+    // coming back, and — as the backstop for a browser that froze the page
+    // without telling us — the first touch or keypress after a stale spell.
+    document.addEventListener("visibilitychange", function () {
+      if (!document.hidden) maybeRefresh("visible");
+    });
+    window.addEventListener("pageshow", function (e) {
+      if (e.persisted) maybeRefresh("pageshow");
+    });
+    window.addEventListener("online", function () { maybeRefresh("online"); });
+    window.addEventListener("focus", function () { maybeRefresh("focus"); });
+    ["pointerdown", "keydown"].forEach(function (ev) {
+      document.addEventListener(ev, function () { maybeRefresh("interaction"); }, true);
+    });
+
     // Snapshot first so the map paints immediately; live status overlays it
     // when it lands, typically alongside the key derivation that just ran.
-    fetchStates().then(function (ok) {
-      if (ok) render();
-      updateStatusLine();
-      if (!ok && sync.cfg) toast("Showing saved status — could not reach the status sheet.");
-    });
+    // From here the poll and the wake-up triggers keep it current.
+    refreshStates("initial");
   }
 })();
 </script>

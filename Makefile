@@ -1,4 +1,4 @@
-.PHONY: build serve fetch clean check
+.PHONY: build serve fetch clean check test
 
 # Full local rebuild from the CSV already in data/.
 build:
@@ -22,6 +22,11 @@ check:
 	m={'v','salt','iv','ct'}-set(e); sys.exit(f'not an envelope: missing {m}') if m else print('site/data.enc.json encrypted OK')"
 	@git status --porcelain site/ | grep -vE 'site/(data\.enc\.json|index\.html|vendor/)' \
 	  && { echo 'unexpected file under site/'; exit 1; } || echo 'site/ contents OK'
+
+# The page's live-status refresh loop, sliced out of site/index.html and run
+# against stubs. Node only; no dependencies, no build step.
+test:
+	node --test tests/*.test.js
 
 clean:
 	rm -rf build
