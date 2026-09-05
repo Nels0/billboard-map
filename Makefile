@@ -18,8 +18,10 @@ serve: build
 
 # Same guard the workflow runs: nothing readable may sit in site/.
 check:
-	@python3 -c "import json,sys; e=json.load(open('site/data.enc.json')); \
-	m={'v','salt','iv','ct'}-set(e); sys.exit(f'not an envelope: missing {m}') if m else print('site/data.enc.json encrypted OK')"
+	@python3 -c "import json,sys; d=json.load(open('site/data.enc.json')); \
+	t=d['tiers'] if 'tiers' in d else {'full': d}; \
+	bad=[(n,{'v','salt','iv','ct'}-set(e)) for n,e in t.items() if {'v','salt','iv','ct'}-set(e)]; \
+	sys.exit(f'not an envelope: {bad}') if bad else print('site/data.enc.json encrypted OK (' + ', '.join(t) + ')')"
 	@git status --porcelain site/ | grep -vE 'site/(data\.enc\.json|index\.html|vendor/)' \
 	  && { echo 'unexpected file under site/'; exit 1; } || echo 'site/ contents OK'
 

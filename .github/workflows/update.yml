@@ -88,6 +88,10 @@ jobs:
         run: python scripts/build_site.py
         env:
           MAP_PASSPHRASE: ${{ secrets.MAP_PASSPHRASE }}
+          # Optional second, lower-trust passphrase. Unset simply means the
+          # build emits the full tier alone, so a missing secret never breaks
+          # the scheduled run.
+          MAP_PASSPHRASE_LITE: ${{ secrets.MAP_PASSPHRASE_LITE }}
           # Baked into the encrypted payload, not into index.html: the
           # deployment URL plus token is a bearer capability to write status,
           # so it sits behind the passphrase like everything else.
@@ -117,13 +121,19 @@ jobs:
           if strays:
               sys.exit(f"unexpected file(s) under site/: {strays}")
 
-          env = json.loads(Path("site/data.enc.json").read_text())
-          missing = {"v", "salt", "iv", "ct"} - set(env)
-          if missing:
-              sys.exit(f"site/data.enc.json is not an envelope (missing {missing})")
-          if not isinstance(env["ct"], str) or len(env["ct"]) < 100:
-              sys.exit("site/data.enc.json ciphertext looks empty")
-          print(f"site/ clean; envelope OK ({len(env['ct'])} chars ciphertext)")
+          doc = json.loads(Path("site/data.enc.json").read_text())
+          # One envelope per access tier since v2; a bare envelope is v1.
+          tiers = doc["tiers"] if "tiers" in doc else {"full": doc}
+          if not tiers:
+              sys.exit("site/data.enc.json has no tiers")
+          for name, env in tiers.items():
+              missing = {"v", "salt", "iv", "ct"} - set(env)
+              if missing:
+                  sys.exit(f"{name} tier is not an envelope (missing {missing})")
+              if not isinstance(env["ct"], str) or len(env["ct"]) < 100:
+                  sys.exit(f"{name} tier ciphertext looks empty")
+          sizes = ", ".join(f"{n}: {len(e['ct'])} chars" for n, e in tiers.items())
+          print(f"site/ clean; {len(tiers)} envelope(s) OK ({sizes})")
           PY
 
       - name: Commit updated data

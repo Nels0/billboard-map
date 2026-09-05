@@ -9,6 +9,7 @@ page needs no third-party crypto library.
 import base64
 import json
 import os
+import sys
 from pathlib import Path
 
 from cryptography.hazmat.primitives import hashes
@@ -16,6 +17,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 ITERATIONS = 600_000
+TIERS_VERSION = 2  # the multi-tier container written by write_tiers()
 SALT_BYTES = 16
 IV_BYTES = 12
 
@@ -61,21 +63,59 @@ def write_encrypted(path: Path, payload: object, passphrase: str) -> None:
     path.write_text(json.dumps(envelope, indent=2), encoding="utf-8")
 
 
+def write_tiers(path: Path, tiers: dict[str, tuple[object, str]]) -> None:
+    """Write several independently-encrypted payloads into one file.
+
+    Shape is {"v": 2, "tiers": {name: envelope}}, where each envelope is exactly
+    what encrypt_json() returns. One file rather than one per tier so the "no
+    stray files under site/" guard keeps its allowlist; the page tries each
+    tier's envelope in turn and keeps whichever one the passphrase opens.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    document = {
+        "v": TIERS_VERSION,
+        "tiers": {
+            name: encrypt_json(payload, passphrase)
+            for name, (payload, passphrase) in tiers.items()
+        },
+    }
+    path.write_text(json.dumps(document, indent=2), encoding="utf-8")
+
+
+def read_tier(document: dict, tier: str, passphrase: str) -> object:
+    """Decrypt one tier of a write_tiers() file, or a bare v1 envelope."""
+    envelope = document.get("tiers", {}).get(tier) if "tiers" in document else document
+    if envelope is None:
+        sys.exit(f"no {tier!r} tier in this file; have {sorted(document.get('tiers', {}))}")
+    return decrypt_json(envelope, passphrase)
+
+
+def passphrase_env(tier: str) -> str:
+    """Which environment variable holds a given tier's passphrase.
+
+    "full" keeps the original MAP_PASSPHRASE so nothing about the existing
+    deployment has to change; every other tier gets MAP_PASSPHRASE_<TIER>.
+    """
+    return "MAP_PASSPHRASE" if tier == "full" else f"MAP_PASSPHRASE_{tier.upper()}"
+
+
 def _cli() -> None:
     """Encrypt/decrypt a JSON file in place-ish, for the geocode cache in CI.
 
     The cache maps addresses to coordinates, so it is committed encrypted even
     though the repository has to be public for GitHub Pages.
     """
-    import sys
-
-    if len(sys.argv) != 4 or sys.argv[1] not in {"encrypt", "decrypt"}:
-        sys.exit("usage: crypto_util.py {encrypt|decrypt} <src> <dst>")
+    if len(sys.argv) not in (4, 5) or sys.argv[1] not in {"encrypt", "decrypt"}:
+        sys.exit("usage: crypto_util.py {encrypt|decrypt} <src> <dst> [tier]")
 
     mode, src, dst = sys.argv[1], Path(sys.argv[2]), Path(sys.argv[3])
-    passphrase = os.environ.get("MAP_PASSPHRASE")
+    # A tier only makes sense for reading site/data.enc.json back; the cache is
+    # a single envelope under MAP_PASSPHRASE and always has been.
+    tier = sys.argv[4] if len(sys.argv) == 5 else None
+    var = passphrase_env(tier) if tier else "MAP_PASSPHRASE"
+    passphrase = os.environ.get(var)
     if not passphrase:
-        sys.exit("MAP_PASSPHRASE is not set.")
+        sys.exit(f"{var} is not set.")
 
     if not src.exists():
         # First ever run: nothing cached yet, which is not an error.
@@ -83,14 +123,15 @@ def _cli() -> None:
         return
 
     payload = json.loads(src.read_text(encoding="utf-8"))
-    result = (
-        encrypt_json(payload, passphrase)
-        if mode == "encrypt"
-        else decrypt_json(payload, passphrase)
-    )
+    if mode == "encrypt":
+        result = encrypt_json(payload, passphrase)
+    elif tier:
+        result = read_tier(payload, tier, passphrase)
+    else:
+        result = decrypt_json(payload, passphrase)
     dst.parent.mkdir(parents=True, exist_ok=True)
     dst.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
-    print(f"{mode}ed {src.name} -> {dst}")
+    print(f"{mode}ed {src.name}{f' [{tier}]' if tier else ''} -> {dst}")
 
 
 if __name__ == "__main__":

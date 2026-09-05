@@ -4,6 +4,10 @@ Turns address data from a Google Sheet into a map, behind a shared passphrase. A
 scheduled GitHub Action re-reads the sheet, geocodes any new addresses, and
 republishes, so the map stays current without anyone re-exporting anything.
 
+There are two passphrases. The second is optional and opens a copy of the same
+map with the contact details removed *before* encryption — see
+[Two access tiers](#two-access-tiers).
+
 Built for form responses where the address data is messy: free-text fields,
 inconsistent spellings, and columns that mean different things on different rows.
 
@@ -17,6 +21,7 @@ Google Sheet ──(service account, read-only)──▶ fetch_sheet.py
                                               geocode.py       Nominatim, region-bounded, cached
                                                     │
                                               build_site.py    → AES-GCM envelope
+                                                    │             (one per tier)
                                                     │
                                      GitHub Pages ──▶ site/index.html
                                                        prompts for passphrase,
@@ -116,6 +121,57 @@ has to be updated whenever the script changes.
 Everything degrades: with no endpoint configured the map still shows whatever
 status the last build baked in, as a read-only field.
 
+## Two access tiers
+
+Some people need the map and the delivery notes but have no reason to hold the
+contact list. `build_site.py` therefore builds the feature collection twice and
+encrypts each copy under its own passphrase:
+
+| Tier | Passphrase | Sees |
+|---|---|---|
+| `full` | `MAP_PASSPHRASE` | everything, contact details included |
+| `lite` | `MAP_PASSPHRASE_LITE` | the map, addresses, delivery notes and the up/down controls — no names, emails or phone numbers |
+
+`site/data.enc.json` holds one envelope per tier:
+
+```json
+{ "v": 2, "tiers": { "full": {"salt": "…", "iv": "…", "ct": "…"},
+                     "lite": {"salt": "…", "iv": "…", "ct": "…"} } }
+```
+
+The page tries each tier in turn and keeps whichever one the passphrase opened,
+so a viewer types one passphrase and never chooses a tier. Points worth keeping
+in mind if you change this:
+
+- **The redaction happens in Python, before encryption.** The lite ciphertext
+  simply does not contain the contact fields. Shipping the full payload and
+  hiding fields in the page would leave the phone numbers sitting in ciphertext
+  that the lite passphrase opens.
+- **Free text is scrubbed, not dropped.** The notes and mounting fields describe
+  the property rather than the person and are what make the map usable for
+  delivery, so they are kept — with phone- and email-shaped substrings replaced
+  by `[redacted]`. That is a pattern match, not a guarantee: a bare first name
+  written into a note survives it.
+- **One file, not two**, so the "nothing readable under `site/`" guard keeps its
+  allowlist and only has to check each envelope in turn.
+- **Unlocking costs one PBKDF2 run per tier tried**, so a wrong passphrase now
+  does roughly twice the work on an old phone. There is no safe shortcut: a
+  cheap per-tier verifier would hand an attacker a fast oracle to brute-force
+  instead of the 600k-iteration stretch.
+- **Both tiers carry the same status endpoint and token.** The Apps Script only
+  ever reads and writes the two up/down tabs, so this hands lite holders nothing
+  they do not already have through the map. It does mean someone who kept the
+  token still has it after the lite passphrase is rotated; closing that means
+  rotating `STATUS_TOKEN` too, which logs out every viewer until they reload.
+- **`MAP_PASSPHRASE_LITE` is optional.** Unset, the build emits the `full` tier
+  alone and the file keeps the same shape, so the scheduled run never breaks for
+  want of a secret. The page also still opens a pre-v2 file that is a single
+  bare envelope.
+
+Unlike the full passphrase, the lite one is cheap to rotate: change the secret,
+re-run the workflow, and the old one stops decrypting. `MAP_PASSPHRASE` and the
+geocode cache are untouched, so no `cache.enc.json` deletion is needed.
+
 ## Privacy
 
 This carries personal information — names, phone numbers, email addresses and
@@ -123,9 +179,10 @@ home addresses. The design follows from that:
 
 - `build_site.py` publishes an **allowlist** of fields, so a new column in the
   export cannot reach the map without someone adding it here on purpose.
-- Contact details **are** published, because the delivery team needs to reach
-  people. The passphrase is therefore the only thing between a public URL and
-  someone's name, phone and email — not merely their street address.
+- Contact details **are** published to the full tier, because the delivery team
+  needs to reach people. The full passphrase is therefore the only thing between
+  a public URL and someone's name, phone and email — not merely their street
+  address. The lite tier exists so that not everyone needs that passphrase.
 - The page vendors Leaflet locally instead of loading it from a CDN. A page that
   prompts for a passphrase should not run third-party script that could capture
   it.
@@ -139,10 +196,12 @@ home addresses. The design follows from that:
   log makes visible and reversible. The endpoint token can also be rotated
   independently of the passphrase.
 
-**Limits of the passphrase model.** One shared secret protects everyone. There is
-no per-person revocation — removing someone's access means changing the
-passphrase and telling everybody the new one, and it cannot stop an authorised
-viewer copying what they see. Because the ciphertext is public and archived, a
+**Limits of the passphrase model.** A shared secret protects everyone holding
+it. There is no per-person revocation — removing someone's access means changing
+the passphrase and telling everybody the new one, and it cannot stop an
+authorised viewer copying what they see. The lite tier narrows the blast radius
+of the passphrase most people hold, and is far cheaper to rotate, but it is the
+same model. Because the ciphertext is public and archived, a
 passphrase that leaks later retroactively decrypts everything ever published.
 
 That is appropriate for a small trusted team, not for wide distribution. Past a
@@ -191,7 +250,10 @@ whatever that step could see.
    you only have view access and cannot share it onward, make your own sheet that
    pulls the data in with `=IMPORTRANGE(...)` and point `SHEET_ID` at yours.
 3. **Repository secrets** (Settings → Secrets and variables → Actions):
-   - `MAP_PASSPHRASE` — the passphrase given to viewers
+   - `MAP_PASSPHRASE` — the passphrase given to viewers who need contact details
+   - `MAP_PASSPHRASE_LITE` — optional second passphrase; same map, contact
+     details removed before encryption. Must differ from `MAP_PASSPHRASE`; the
+     build fails loudly if it does not. Leave it unset to publish one tier only.
    - `SHEET_ID` — the id from the sheet URL, between `/d/` and `/edit`
    - `GOOGLE_SERVICE_ACCOUNT_JSON` — the whole key file contents
 4. **Repository variable** `SHEET_TAB` — the tab holding the responses. Without
@@ -224,6 +286,7 @@ commit, since the old cache can no longer be decrypted.
 ```bash
 pip install -r requirements.txt
 export MAP_PASSPHRASE='…'
+export MAP_PASSPHRASE_LITE='…'                # optional second tier
 
 python scripts/normalise.py            # data/responses.csv → build/records.plain.json
 python scripts/geocode.py              # adds build/geocode-cache.plain.json
@@ -237,6 +300,14 @@ sheet is configured, and warns rather than failing when one is configured but
 unreachable — a missing fallback must never break the map build. Set
 `STATUS_ENDPOINT` and `STATUS_TOKEN` before `build_site.py` to exercise the live
 path locally.
+
+Read a tier back to check what it actually contains:
+
+```bash
+MAP_PASSPHRASE_LITE='…' python scripts/crypto_util.py \
+  decrypt site/data.enc.json /tmp/lite.json lite
+grep -c '@' /tmp/lite.json                    # expect 0
+```
 
 `build/`, `data/` and `site/data.enc.json` are gitignored; they are the only
 places plaintext or locally-keyed data exists. Use a throwaway passphrase

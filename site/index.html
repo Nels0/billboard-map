@@ -289,6 +289,11 @@
   var KEY = "wlb26-map-pass";
   var WHO = "wlb26-map-who";
   var data = null, map = null, layer = null, markers = {}, listEls = {};
+  // Which envelope the passphrase opened. "full" carries the hosts' contact
+  // details; "lite" is the same map with them removed before encryption, so
+  // there is nothing here to hide - they are simply not in the ciphertext.
+  var TIER_ORDER = ["full", "lite"];
+  var tier = "full";
   var byId = {};        // id -> feature; status updates mutate these in place
   var pending = {};     // id -> true while a status write is in flight
   // cfg is null until status tracking is configured; live says whether the
@@ -344,8 +349,23 @@
   });
 
   async function attempt(pass, remember) {
-    var env = await envelope;
-    var payload = await decrypt(env, pass);   // throws if the passphrase is wrong
+    var file = await envelope;
+    // v1 files were a single bare envelope; v2 holds one per tier. Each tier
+    // costs a full 600k-iteration PBKDF2 run, so a wrong passphrase is about
+    // twice the work of before - there is no cheap per-tier verifier that does
+    // not also hand an attacker a fast oracle.
+    var tiers = file.tiers || { full: file };
+    var payload = null, failure = null;
+    for (var i = 0; i < TIER_ORDER.length; i++) {
+      var name = TIER_ORDER[i];
+      if (!tiers[name]) continue;
+      try {
+        payload = await decrypt(tiers[name], pass);  // throws if this is not the one
+        tier = name;
+        break;
+      } catch (e) { failure = e; }
+    }
+    if (!payload) throw failure || new Error("could not load map data (no tiers)");
     store(pass, remember);
     data = payload;
     gate.style.display = "none";
@@ -786,9 +806,13 @@
     if (p.email) {
       bits.push('<div><a href="mailto:' + esc(p.email) + '">' + esc(p.email) + "</a></div>");
     }
-    return bits.length
-      ? '<div class="contact">' + bits.join("") + "</div>"
-      : '<div class="nocontact">No contact details on this response.</div>';
+    if (bits.length) return '<div class="contact">' + bits.join("") + "</div>";
+    // On the lite tier every card would otherwise claim the sheet holds no
+    // contact details, which is not what happened: they were removed at build
+    // time and this passphrase never had them.
+    return '<div class="nocontact">' + (tier === "full"
+      ? "No contact details on this response."
+      : "Contact details are not included with this passphrase.") + "</div>";
   }
 
   function popup(f) {
